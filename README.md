@@ -1,67 +1,55 @@
-# Payload Blank Template
+# bulkOperationsSingleTransaction reports rolled-back documents as updated and deleted
 
-This template comes configured with the bare minimum to get started on anything you need.
+Minimal reproduction for Payload `3.90.2`, created with `create-payload-app -t blank` (MongoDB).
 
-## Quick start
+`mongooseAdapter({ bulkOperationsSingleTransaction: true })` is documented as processing bulk update and delete documents "one at a time in separate transactions". It is also on by default in the DocumentDB and Cosmos DB compatibility options. With it on, one failing document rolls back other documents that the operation still returns in `docs` as updated or deleted.
 
-This template can be deployed directly from our Cloud hosting and it will setup MongoDB and cloud S3 object storage for media.
+## Run
 
-## Quick Start - local setup
+```bash
+pnpm install
+pnpm test:int
+```
 
-To spin up this template locally, follow these steps:
+Nothing to set up: the test starts a single-node MongoDB 7.0.24 replica set with `mongodb-memory-server`. The two tests fail on `3.90.2`.
 
-### Clone
+## What the reproduction does
 
-After you click the `Deploy` button above, you'll want to have standalone copy of this repo on your machine. If you've already cloned this repo, skip to [Development](#development).
+- `src/payload.config.ts` turns on `bulkOperationsSingleTransaction`.
+- `src/collections/Posts.ts` adds a `posts` collection whose hooks refuse to update or delete the post titled `fail`. The delete hook waits one second before refusing, standing in for a hook that does async work, so the other posts are processed first.
+- `tests/int/bulk-operations-single-transaction.int.spec.ts` creates the posts `a`, `b`, `fail`, `c`, `d` in that order, then:
+  1. bulk updates all five, sorted by `createdAt`, with `status: 'archived'`
+  2. bulk deletes all five
 
-### Development
+  It then compares what Payload returns with what is in the database.
 
-1. First [clone the repo](#clone) if you have not done so already
-2. `cd my-project && cp .env.example .env` to copy the example environment variables. You'll need to add the `MONGODB_URL` from your Cloud project to your `.env` if you want to use S3 storage and the MongoDB database that was created for you.
+## Expected
 
-3. `pnpm install && pnpm dev` to install dependencies and start the dev server
-4. open `http://localhost:3000` to open the app in your browser
+Each document has its own transaction, so `fail` only affects itself:
 
-That's it! Changes made in `./src` will be reflected in your app. Follow the on-screen instructions to login and create your first admin user. Then check out [Production](#production) once you're ready to build and serve your app, and [Deployment](#deployment) when you're ready to go live.
+- Bulk update: `docs` is `a, b, c, d`, `errors` has `fail`, and `a, b, c, d` are archived.
+- Bulk delete: `docs` is `a, b, c, d`, `errors` has `fail`, and only `fail` is left in the database.
 
-#### Docker (Optional)
+## Actual
 
-If you prefer to use Docker for local development instead of a local MongoDB instance, the provided docker-compose.yml file can be used.
+```text
+bulk update {
+  reportedUpdated: [ 'a', 'b', 'c', 'd' ],
+  reportedErrors: [ 'This post cannot be updated' ],
+  actuallyArchived: [ 'c', 'd' ],
+  notArchived: [ 'a', 'b', 'fail' ]
+}
+bulk delete {
+  reportedDeleted: [ 'a', 'b', 'c', 'd' ],
+  reportedErrors: [ 'This post cannot be deleted' ],
+  stillInDatabase: [ 'a', 'b', 'c', 'd', 'fail' ]
+}
+```
 
-To do so, follow these steps:
+## Where it happens (`payload@3.90.2`, `dist/collections/operations`)
 
-- Modify the `MONGODB_URL` in your `.env` file to `mongodb://127.0.0.1/<dbname>`
-- Modify the `docker-compose.yml` file's `MONGODB_URL` to match the above `<dbname>`
-- Run `docker-compose up` to start the database, optionally pass `-d` to run in the background.
+- `update.js:37` and `delete.js:28` start one transaction for the whole operation. The per-document `initTransaction(req)` (`update.js:206`, `delete.js:92`) then returns `false`, because `req` already has that transaction, so no document gets its own.
+- When a document fails, its `catch` calls `killTransaction(req)` (`update.js:291`, `delete.js:225`). That rolls back the shared transaction, including documents already returned in `docs`, and removes it from `req`, so the documents after it start their own transactions.
+- `delete.js:85` starts every document at once (`docs.map(async ...)`), so the "sequential" loop at `delete.js:238-242` only awaits documents that are already running.
 
-## How it works
-
-The Payload config is tailored specifically to the needs of most websites. It is pre-configured in the following ways:
-
-### Collections
-
-See the [Collections](https://payloadcms.com/docs/configuration/collections) docs for details on how to extend this functionality.
-
-- #### Users (Authentication)
-
-  Users are auth-enabled collections that have access to the admin panel.
-
-  For additional help, see the official [Auth Example](https://github.com/payloadcms/payload/tree/3.x/examples/auth) or the [Authentication](https://payloadcms.com/docs/authentication/overview#authentication-overview) docs.
-
-- #### Media
-
-  This is the uploads enabled collection. It features pre-configured sizes, focal point and manual resizing to help you manage your pictures.
-
-### Docker
-
-Alternatively, you can use [Docker](https://www.docker.com) to spin up this template locally. To do so, follow these steps:
-
-1. Follow [steps 1 and 2 from above](#development), the docker-compose file will automatically use the `.env` file in your project root
-1. Next run `docker-compose up`
-1. Follow [steps 4 and 5 from above](#development) to login and create your first admin user
-
-That's it! The Docker instance will help you get up and running quickly while also standardizing the development environment across your teams.
-
-## Questions
-
-If you have any issues or questions, reach out to us on [Discord](https://discord.com/invite/payload) or start a [GitHub discussion](https://github.com/payloadcms/payload/discussions).
+Skipping the operation-level transaction when `bulkOperationsSingleTransaction` is on (as `delete.js` in `4.0.0-canary.37` already does) and running the delete documents one after another makes both tests pass.
